@@ -3,8 +3,11 @@ import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, VERTICAL, X, Y, StringVar, Tk, messagebox
+from tkinter import BOTH, END, LEFT, VERTICAL, X, Y, StringVar, Tk, messagebox
 from tkinter import ttk
+
+import pythoncom
+import win32com.client
 
 
 APP_TITLE = "WindowsTools20260702V1"
@@ -16,6 +19,13 @@ class AppEntry:
     name: str
     path: str
     source: str
+
+
+@dataclass(frozen=True)
+class LaunchTarget:
+    file_path: str
+    arguments: str
+    working_directory: str | None
 
 
 def get_scan_roots() -> list[tuple[str, Path]]:
@@ -58,8 +68,55 @@ def scan_apps() -> list[AppEntry]:
     return sorted(entries.values(), key=lambda entry: entry.name.lower())
 
 
-def launch_as_admin(path: str) -> tuple[bool, str]:
-    file_path = Path(path)
+def resolve_shortcut(path: str) -> tuple[LaunchTarget | None, str | None]:
+    shortcut_path = Path(path)
+    if not shortcut_path.exists():
+        return None, "快捷方式不存在，可能已经被移动或删除。"
+
+    suffix = shortcut_path.suffix.lower()
+    if suffix != ".lnk":
+        if suffix == ".exe":
+            return LaunchTarget(str(shortcut_path), "", str(shortcut_path.parent)), None
+        return None, f"当前只支持启动 exe 或解析 lnk 快捷方式，文件类型为：{suffix or '未知'}"
+
+    shell = None
+    shortcut = None
+    pythoncom.CoInitialize()
+    try:
+        shell = win32com.client.Dispatch("WScript.Shell")
+        shortcut = shell.CreateShortcut(str(shortcut_path))
+        target_path = os.path.expandvars(shortcut.TargetPath or "").strip()
+        arguments = os.path.expandvars(shortcut.Arguments or "").strip()
+        working_directory = os.path.expandvars(shortcut.WorkingDirectory or "").strip()
+    except Exception as exc:
+        return None, f"无法解析快捷方式：{exc}"
+    finally:
+        shortcut = None
+        shell = None
+        pythoncom.CoUninitialize()
+
+    if not target_path:
+        return None, "快捷方式没有可启动的目标程序。"
+
+    target = Path(target_path)
+    if not target.exists():
+        return None, f"快捷方式目标不存在：{target_path}"
+    if target.suffix.lower() != ".exe":
+        return None, f"当前只支持以管理员权限启动 exe，目标类型为：{target.suffix or '未知'}"
+
+    cwd = working_directory if working_directory and Path(working_directory).exists() else str(target.parent)
+    return LaunchTarget(str(target), arguments, cwd), None
+
+
+def launch_as_admin(app: AppEntry) -> tuple[bool, str]:
+    target, error = resolve_shortcut(app.path)
+    if error:
+        return False, f"{error}\n快捷方式路径：{app.path}"
+
+    if target is None:
+        return False, f"无法解析启动目标。\n快捷方式路径：{app.path}"
+
+    file_path = Path(target.file_path)
     if not file_path.exists():
         return False, "文件不存在，可能已经被移动或卸载。"
 
@@ -67,8 +124,8 @@ def launch_as_admin(path: str) -> tuple[bool, str]:
         None,
         "runas",
         str(file_path),
-        None,
-        None,
+        target.arguments or None,
+        target.working_directory,
         1,
     )
     if result > 32:
@@ -111,12 +168,15 @@ class WindowsToolsApp:
         search = ttk.Entry(top, textvariable=self.query)
         search.pack(side=LEFT, fill=X, expand=True, padx=(8, 8))
         search.bind("<KeyRelease>", lambda _event: self.apply_filter())
+        search.bind("<Escape>", lambda _event: self.clear_search())
 
         ttk.Button(top, text="刷新", command=self.refresh).pack(side=LEFT, padx=(0, 8))
         ttk.Button(top, text="管理员启动", command=self.launch_selected).pack(side=LEFT)
 
         body = ttk.Frame(main)
         body.pack(fill=BOTH, expand=True, pady=(12, 8))
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
 
         columns = ("name", "source", "path")
         self.tree = ttk.Treeview(body, columns=columns, show="headings", selectmode="browse")
@@ -127,10 +187,10 @@ class WindowsToolsApp:
         self.tree.column("source", width=120, anchor="w")
         self.tree.column("path", width=520, anchor="w")
         self.tree.bind("<Double-1>", lambda _event: self.launch_selected())
-        self.tree.pack(side=LEFT, fill=BOTH, expand=True)
+        self.tree.grid(row=0, column=0, sticky="nsew")
 
         scrollbar = ttk.Scrollbar(body, orient=VERTICAL, command=self.tree.yview)
-        scrollbar.pack(side=RIGHT, fill=Y)
+        scrollbar.grid(row=0, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=scrollbar.set)
 
         bottom = ttk.Frame(main)
@@ -152,14 +212,12 @@ class WindowsToolsApp:
         self.apply_filter()
 
     def apply_filter(self) -> None:
-        keyword = self.query.get().strip().lower()
-        if keyword:
+        keywords = [part for part in self.query.get().strip().lower().split() if part]
+        if keywords:
             self.filtered_apps = [
                 app
                 for app in self.apps
-                if keyword in app.name.lower()
-                or keyword in app.source.lower()
-                or keyword in app.path.lower()
+                if all(self.match_app(app, keyword) for keyword in keywords)
             ]
         else:
             self.filtered_apps = list(self.apps)
@@ -170,6 +228,18 @@ class WindowsToolsApp:
 
         self.status.set(f"共 {len(self.apps)} 项，当前显示 {len(self.filtered_apps)} 项。双击也可以启动。")
 
+    def match_app(self, app: AppEntry, keyword: str) -> bool:
+        return (
+            keyword in app.name.lower()
+            or keyword in app.source.lower()
+            or keyword in app.path.lower()
+        )
+
+    def clear_search(self) -> None:
+        if self.query.get():
+            self.query.set("")
+            self.apply_filter()
+
     def launch_selected(self) -> None:
         selection = self.tree.selection()
         if not selection:
@@ -178,7 +248,7 @@ class WindowsToolsApp:
 
         index = int(selection[0])
         app = self.filtered_apps[index]
-        success, message = launch_as_admin(app.path)
+        success, message = launch_as_admin(app)
         self.status.set(f"{app.name}: {message}")
         if not success:
             messagebox.showerror(APP_TITLE, message)
