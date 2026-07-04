@@ -12,6 +12,9 @@ import win32com.client
 
 APP_TITLE = "WindowsTools20260702V1"
 SUPPORTED_EXTENSIONS = {".lnk", ".exe", ".appref-ms"}
+FILTER_ALL = "全部"
+SOURCE_START_MENU = "开始菜单"
+SOURCE_DESKTOP = "桌面"
 
 
 @dataclass(frozen=True)
@@ -19,6 +22,7 @@ class AppEntry:
     name: str
     path: str
     source: str
+    source_group: str
 
 
 @dataclass(frozen=True)
@@ -50,6 +54,12 @@ def display_name_from_path(path: Path) -> str:
     return name or path.name
 
 
+def source_group_from_source(source: str) -> str:
+    if source in ("系统开始菜单", "用户开始菜单"):
+        return SOURCE_START_MENU
+    return SOURCE_DESKTOP
+
+
 def scan_apps() -> list[AppEntry]:
     entries: dict[str, AppEntry] = {}
 
@@ -61,7 +71,12 @@ def scan_apps() -> list[AppEntry]:
 
                 name = display_name_from_path(item)
                 key = f"{name.lower()}|{str(item).lower()}"
-                entries[key] = AppEntry(name=name, path=str(item), source=source)
+                entries[key] = AppEntry(
+                    name=name,
+                    path=str(item),
+                    source=source,
+                    source_group=source_group_from_source(source),
+                )
         except OSError:
             continue
 
@@ -149,7 +164,7 @@ class WindowsToolsApp:
         self.root.geometry("900x540")
         self.root.minsize(760, 420)
 
-        self.query = StringVar()
+        self.source_filter = StringVar(value=FILTER_ALL)
         self.status = StringVar(value="正在扫描当前 Windows 开始菜单和桌面软件...")
         self.apps: list[AppEntry] = []
         self.filtered_apps: list[AppEntry] = []
@@ -164,11 +179,16 @@ class WindowsToolsApp:
         top = ttk.Frame(main)
         top.pack(fill=X)
 
-        ttk.Label(top, text="搜索").pack(side=LEFT)
-        search = ttk.Entry(top, textvariable=self.query)
-        search.pack(side=LEFT, fill=X, expand=True, padx=(8, 8))
-        search.bind("<KeyRelease>", lambda _event: self.apply_filter())
-        search.bind("<Escape>", lambda _event: self.clear_search())
+        ttk.Label(top, text="来源").pack(side=LEFT)
+        self.source_box = ttk.Combobox(
+            top,
+            textvariable=self.source_filter,
+            values=(FILTER_ALL, SOURCE_START_MENU, SOURCE_DESKTOP),
+            state="readonly",
+            width=10,
+        )
+        self.source_box.pack(side=LEFT, padx=(8, 8))
+        self.source_box.bind("<<ComboboxSelected>>", lambda _event: self.apply_filter())
 
         ttk.Button(top, text="刷新", command=self.refresh).pack(side=LEFT, padx=(0, 8))
         ttk.Button(top, text="管理员启动", command=self.launch_selected).pack(side=LEFT)
@@ -212,12 +232,12 @@ class WindowsToolsApp:
         self.apply_filter()
 
     def apply_filter(self) -> None:
-        keywords = [part for part in self.query.get().strip().lower().split() if part]
-        if keywords:
+        source = self.source_filter.get()
+        if source != FILTER_ALL:
             self.filtered_apps = [
                 app
                 for app in self.apps
-                if all(self.match_app(app, keyword) for keyword in keywords)
+                if app.source_group == source
             ]
         else:
             self.filtered_apps = list(self.apps)
@@ -226,19 +246,9 @@ class WindowsToolsApp:
         for index, app in enumerate(self.filtered_apps):
             self.tree.insert("", END, iid=str(index), values=(app.name, app.source, app.path))
 
-        self.status.set(f"共 {len(self.apps)} 项，当前显示 {len(self.filtered_apps)} 项。双击也可以启动。")
-
-    def match_app(self, app: AppEntry, keyword: str) -> bool:
-        return (
-            keyword in app.name.lower()
-            or keyword in app.source.lower()
-            or keyword in app.path.lower()
+        self.status.set(
+            f"共 {len(self.apps)} 项，当前显示 {len(self.filtered_apps)} 项，来源：{source}。双击也可以启动。"
         )
-
-    def clear_search(self) -> None:
-        if self.query.get():
-            self.query.set("")
-            self.apply_filter()
 
     def launch_selected(self) -> None:
         selection = self.tree.selection()
