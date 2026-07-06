@@ -164,6 +164,7 @@ class WindowsToolsApp:
         self.root.geometry("900x540")
         self.root.minsize(760, 420)
 
+        self.query = StringVar()
         self.source_filter = StringVar(value=FILTER_ALL)
         self.status = StringVar(value="正在扫描当前 Windows 开始菜单和桌面软件...")
         self.apps: list[AppEntry] = []
@@ -178,6 +179,12 @@ class WindowsToolsApp:
 
         top = ttk.Frame(main)
         top.pack(fill=X)
+
+        ttk.Label(top, text="搜索").pack(side=LEFT)
+        search = ttk.Entry(top, textvariable=self.query)
+        search.pack(side=LEFT, fill=X, expand=True, padx=(8, 10))
+        search.bind("<KeyRelease>", lambda _event: self.apply_filter())
+        search.bind("<Escape>", lambda _event: self.clear_search())
 
         ttk.Label(top, text="来源").pack(side=LEFT)
         self.source_box = ttk.Combobox(
@@ -232,15 +239,16 @@ class WindowsToolsApp:
         self.apply_filter()
 
     def apply_filter(self) -> None:
+        keywords = [part for part in self.query.get().strip().lower().split() if part]
         source = self.source_filter.get()
-        if source != FILTER_ALL:
-            self.filtered_apps = [
-                app
-                for app in self.apps
-                if app.source_group == source
-            ]
-        else:
-            self.filtered_apps = list(self.apps)
+        self.filtered_apps = []
+
+        for app in self.apps:
+            if source != FILTER_ALL and app.source_group != source:
+                continue
+            if keywords and not all(self.match_app(app, keyword) for keyword in keywords):
+                continue
+            self.filtered_apps.append(app)
 
         self.tree.delete(*self.tree.get_children())
         for index, app in enumerate(self.filtered_apps):
@@ -249,6 +257,18 @@ class WindowsToolsApp:
         self.status.set(
             f"共 {len(self.apps)} 项，当前显示 {len(self.filtered_apps)} 项，来源：{source}。双击也可以启动。"
         )
+
+    def match_app(self, app: AppEntry, keyword: str) -> bool:
+        return (
+            keyword in app.name.lower()
+            or keyword in app.source.lower()
+            or keyword in app.path.lower()
+        )
+
+    def clear_search(self) -> None:
+        if self.query.get():
+            self.query.set("")
+            self.apply_filter()
 
     def launch_selected(self) -> None:
         selection = self.tree.selection()
