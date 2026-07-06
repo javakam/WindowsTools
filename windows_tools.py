@@ -7,7 +7,7 @@ import threading
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, VERTICAL, X, Y, StringVar, Tk, messagebox
+from tkinter import BOTH, END, LEFT, Menu, VERTICAL, X, Y, StringVar, Tk, messagebox
 from tkinter import font as tkfont
 from tkinter import ttk
 from xml.etree import ElementTree
@@ -22,16 +22,16 @@ FILTER_ALL = "全部"
 SOURCE_START_MENU = "开始菜单"
 SOURCE_DESKTOP = "桌面"
 SOURCE_START_PINNED = "开始固定"
-WINDOW_WIDTH = 1180
-WINDOW_HEIGHT = 680
-MIN_WINDOW_WIDTH = 960
-MIN_WINDOW_HEIGHT = 520
-NAME_COLUMN_WIDTH = 260
-SOURCE_COLUMN_WIDTH = 120
-PATH_COLUMN_WIDTH = 760
-MAX_NAME_COLUMN_WIDTH = 340
-MAX_SOURCE_COLUMN_WIDTH = 150
-MAX_MEASURED_ROWS = 300
+SOURCE_FILTERS = (FILTER_ALL, SOURCE_START_MENU, SOURCE_START_PINNED, SOURCE_DESKTOP)
+WINDOW_WIDTH = 1280
+WINDOW_HEIGHT = 720
+MIN_WINDOW_WIDTH = 1080
+MIN_WINDOW_HEIGHT = 560
+NAME_COLUMN_WIDTH = 300
+SOURCE_COLUMN_WIDTH = 130
+PATH_MIN_COLUMN_WIDTH = 760
+UI_FONT_SIZE = 10
+TREE_ROW_HEIGHT = 28
 
 
 @dataclass(frozen=True)
@@ -191,7 +191,7 @@ def scan_apps() -> list[AppEntry]:
     for source, root in get_scan_roots():
         try:
             for item in root.rglob("*"):
-                if not item.is_file() or item.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                if item.suffix.lower() not in SUPPORTED_EXTENSIONS or not item.is_file():
                     continue
 
                 name = display_name_from_path(item)
@@ -276,8 +276,10 @@ def resolve_shortcut(path: str) -> tuple[LaunchTarget | None, str | None]:
 
     shell = None
     shortcut = None
-    pythoncom.CoInitialize()
+    co_initialized = False
     try:
+        pythoncom.CoInitialize()
+        co_initialized = True
         shell = win32com.client.Dispatch("WScript.Shell")
         shortcut = shell.CreateShortcut(str(shortcut_path))
         target_path = os.path.expandvars(shortcut.TargetPath or "").strip()
@@ -288,7 +290,8 @@ def resolve_shortcut(path: str) -> tuple[LaunchTarget | None, str | None]:
     finally:
         shortcut = None
         shell = None
-        pythoncom.CoUninitialize()
+        if co_initialized:
+            pythoncom.CoUninitialize()
 
     if not target_path:
         return None, "快捷方式没有可启动的目标程序。"
@@ -344,16 +347,30 @@ class WindowsToolsApp:
         self.root.title(APP_TITLE)
         self.root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         self.root.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self._configure_fonts()
 
         self.query = StringVar()
         self.source_filter = StringVar(value=FILTER_ALL)
         self.status = StringVar(value="正在扫描当前 Windows 开始菜单、桌面和开始固定项...")
         self.apps: list[AppEntry] = []
         self.filtered_apps: list[AppEntry] = []
+        self.is_closing = False
 
         self._build_ui()
         self._center_window()
         self.refresh()
+
+    def _configure_fonts(self) -> None:
+        for font_name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+            try:
+                named_font = tkfont.nametofont(font_name)
+            except Exception:
+                continue
+
+            named_font.configure(size=UI_FONT_SIZE)
+            if font_name == "TkHeadingFont":
+                named_font.configure(weight="bold")
 
     def _center_window(self) -> None:
         self.root.update_idletasks()
@@ -364,34 +381,34 @@ class WindowsToolsApp:
         self.root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}+{x}+{y}")
 
     def _build_ui(self) -> None:
+        style = ttk.Style(self.root)
+        style.configure("SourceTitle.TLabel", font=("Microsoft YaHei UI", UI_FONT_SIZE, "bold"), foreground="#1f5fa8")
+        style.configure("Treeview", rowheight=TREE_ROW_HEIGHT)
+        style.configure("Treeview.Heading", font=("Microsoft YaHei UI", UI_FONT_SIZE, "bold"))
+
         main = ttk.Frame(self.root, padding=12)
         main.pack(fill=BOTH, expand=True)
 
-        top = ttk.Frame(main)
+        top = ttk.Frame(main, padding=(10, 8), relief="groove", borderwidth=1)
         top.pack(fill=X)
-        top.columnconfigure(7, weight=1)
 
-        ttk.Label(top, text="搜索").grid(row=0, column=0, sticky="w")
+        ttk.Label(top, text="搜索").pack(side=LEFT)
         search = ttk.Entry(top, textvariable=self.query)
-        search.configure(width=34)
-        search.grid(row=0, column=1, sticky="w", padx=(8, 16))
+        search.configure(width=32)
+        search.pack(side=LEFT, padx=(8, 18))
         search.bind("<KeyRelease>", lambda _event: self.apply_filter())
         search.bind("<Escape>", lambda _event: self.clear_search())
 
-        ttk.Label(top, text="来源").grid(row=0, column=2, sticky="w")
-        self.source_box = ttk.Combobox(
-            top,
-            textvariable=self.source_filter,
-            values=(FILTER_ALL, SOURCE_START_MENU, SOURCE_DESKTOP, SOURCE_START_PINNED),
-            state="readonly",
-            width=10,
-        )
-        self.source_box.grid(row=0, column=3, sticky="w", padx=(8, 16))
-        self.source_box.bind("<<ComboboxSelected>>", lambda _event: self.apply_filter())
-
-        ttk.Button(top, text="清空", command=self.clear_search).grid(row=0, column=4, sticky="w", padx=(0, 8))
-        ttk.Button(top, text="刷新", command=self.refresh).grid(row=0, column=5, sticky="w", padx=(0, 8))
-        ttk.Button(top, text="管理员启动", command=self.launch_selected).grid(row=0, column=6, sticky="w")
+        ttk.Separator(top, orient=VERTICAL).pack(side=LEFT, fill=Y, padx=(0, 12))
+        ttk.Label(top, text="来源", style="SourceTitle.TLabel").pack(side=LEFT, padx=(0, 10))
+        for source in SOURCE_FILTERS:
+            ttk.Radiobutton(
+                top,
+                text=source,
+                value=source,
+                variable=self.source_filter,
+                command=self.apply_filter,
+            ).pack(side=LEFT, padx=(0, 10))
 
         body = ttk.Frame(main)
         body.pack(fill=BOTH, expand=True, pady=(12, 8))
@@ -405,10 +422,14 @@ class WindowsToolsApp:
         self.tree.heading("path", text="路径")
         self.tree.column("name", width=NAME_COLUMN_WIDTH, minwidth=180, anchor="w", stretch=False)
         self.tree.column("source", width=SOURCE_COLUMN_WIDTH, minwidth=100, anchor="w", stretch=False)
-        self.tree.column("path", width=PATH_COLUMN_WIDTH, minwidth=480, anchor="w", stretch=True)
+        self.tree.column("path", width=PATH_MIN_COLUMN_WIDTH, minwidth=560, anchor="w", stretch=True)
         self.tree.bind("<Double-1>", lambda _event: self.launch_selected())
         self.tree.bind("<Configure>", lambda _event: self.update_column_widths())
+        self.tree.bind("<Button-3>", self.show_context_menu)
         self.tree.grid(row=0, column=0, sticky="nsew")
+
+        self.context_menu = Menu(self.root, tearoff=False)
+        self.context_menu.add_command(label="管理员启动", command=self.launch_selected)
 
         scrollbar = ttk.Scrollbar(body, orient=VERTICAL, command=self.tree.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
@@ -426,9 +447,18 @@ class WindowsToolsApp:
 
     def _refresh_worker(self) -> None:
         apps = scan_apps()
-        self.root.after(0, lambda: self._finish_refresh(apps))
+        if self.is_closing:
+            return
+
+        try:
+            self.root.after(0, lambda: self._finish_refresh(apps))
+        except RuntimeError:
+            return
 
     def _finish_refresh(self, apps: list[AppEntry]) -> None:
+        if self.is_closing:
+            return
+
         self.apps = apps
         self.apply_filter()
 
@@ -450,7 +480,7 @@ class WindowsToolsApp:
 
         self.update_column_widths()
         self.status.set(
-            f"共 {len(self.apps)} 项，当前显示 {len(self.filtered_apps)} 项，来源：{source}。双击也可以启动。"
+            f"共 {len(self.apps)} 项，当前显示 {len(self.filtered_apps)} 项，来源：{source}。右键可管理员启动，双击也可以启动。"
         )
 
     def update_column_widths(self) -> None:
@@ -458,20 +488,24 @@ class WindowsToolsApp:
         if tree_width <= 1:
             return
 
-        ui_font = tkfont.nametofont("TkDefaultFont")
-        name_width = NAME_COLUMN_WIDTH
-        source_width = SOURCE_COLUMN_WIDTH
-        for app in self.filtered_apps[:MAX_MEASURED_ROWS]:
-            name_width = max(name_width, ui_font.measure(app.name) + 32)
-            source_width = max(source_width, ui_font.measure(app.source) + 32)
+        path_width = max(tree_width - NAME_COLUMN_WIDTH - SOURCE_COLUMN_WIDTH - 8, PATH_MIN_COLUMN_WIDTH)
 
-        name_width = min(name_width, MAX_NAME_COLUMN_WIDTH)
-        source_width = min(source_width, MAX_SOURCE_COLUMN_WIDTH)
-        path_width = max(tree_width - name_width - source_width - 8, 480)
-
-        self.tree.column("name", width=name_width)
-        self.tree.column("source", width=source_width)
+        self.tree.column("name", width=NAME_COLUMN_WIDTH)
+        self.tree.column("source", width=SOURCE_COLUMN_WIDTH)
         self.tree.column("path", width=path_width)
+
+    def show_context_menu(self, event) -> str:
+        item_id = self.tree.identify_row(event.y)
+        if not item_id:
+            return "break"
+
+        self.tree.selection_set(item_id)
+        self.tree.focus(item_id)
+        try:
+            self.context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.context_menu.grab_release()
+        return "break"
 
     def match_app(self, app: AppEntry, keyword: str) -> bool:
         return (
@@ -500,6 +534,10 @@ class WindowsToolsApp:
 
     def run(self) -> None:
         self.root.mainloop()
+
+    def close(self) -> None:
+        self.is_closing = True
+        self.root.destroy()
 
 
 if __name__ == "__main__":
