@@ -1,12 +1,15 @@
 import ctypes
+import json
 import os
 import subprocess
+import tempfile
 import threading
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import BOTH, END, LEFT, VERTICAL, X, Y, StringVar, Tk, messagebox
 from tkinter import ttk
+from xml.etree import ElementTree
 
 import pythoncom
 import win32com.client
@@ -17,6 +20,7 @@ SUPPORTED_EXTENSIONS = {".lnk", ".exe", ".appref-ms"}
 FILTER_ALL = "全部"
 SOURCE_START_MENU = "开始菜单"
 SOURCE_DESKTOP = "桌面"
+SOURCE_START_PINNED = "开始固定"
 
 
 @dataclass(frozen=True)
@@ -59,7 +63,115 @@ def display_name_from_path(path: Path) -> str:
 def source_group_from_source(source: str) -> str:
     if source in ("系统开始菜单", "用户开始菜单"):
         return SOURCE_START_MENU
+    if source == SOURCE_START_PINNED:
+        return SOURCE_START_PINNED
     return SOURCE_DESKTOP
+
+
+def powershell_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def export_start_layout_text() -> str | None:
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+    with tempfile.TemporaryDirectory(prefix="windowstools_start_layout_") as temp_dir:
+        for file_name in ("layout.json", "layout.xml"):
+            layout_path = Path(temp_dir) / file_name
+            command = [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                f"Export-StartLayout -Path {powershell_quote(str(layout_path))}",
+            ]
+
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    creationflags=creationflags,
+                    encoding="utf-8",
+                    errors="replace",
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+
+            if result.returncode == 0 and layout_path.exists():
+                try:
+                    return layout_path.read_text(encoding="utf-8-sig")
+                except OSError:
+                    return None
+
+    return None
+
+
+def desktop_links_from_start_layout(layout_text: str) -> list[str]:
+    text = layout_text.strip()
+    if not text:
+        return []
+
+    if text.startswith("{"):
+        return desktop_links_from_start_layout_json(text)
+    return desktop_links_from_start_layout_xml(text)
+
+
+def desktop_links_from_start_layout_json(layout_text: str) -> list[str]:
+    try:
+        layout = json.loads(layout_text)
+    except json.JSONDecodeError:
+        return []
+
+    links: list[str] = []
+    for item in layout.get("pinnedList", []):
+        if not isinstance(item, dict):
+            continue
+        link = item.get("desktopAppLink")
+        if isinstance(link, str) and link.strip():
+            links.append(link.strip())
+    return links
+
+
+def desktop_links_from_start_layout_xml(layout_text: str) -> list[str]:
+    try:
+        root = ElementTree.fromstring(layout_text)
+    except ElementTree.ParseError:
+        return []
+
+    links: list[str] = []
+    for element in root.iter():
+        for name, value in element.attrib.items():
+            if name.endswith("DesktopApplicationLinkPath") and value.strip():
+                links.append(value.strip())
+    return links
+
+
+def scan_start_pinned_apps() -> list[AppEntry]:
+    layout_text = export_start_layout_text()
+    if not layout_text:
+        return []
+
+    entries: dict[str, AppEntry] = {}
+    for link in desktop_links_from_start_layout(layout_text):
+        path = Path(os.path.expandvars(link))
+        if not path.exists() or not path.is_file() or path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            continue
+
+        name = display_name_from_path(path)
+        key = f"{name.lower()}|{str(path).lower()}|{SOURCE_START_PINNED}"
+        entries[key] = AppEntry(
+            name=name,
+            path=str(path),
+            source=SOURCE_START_PINNED,
+            source_group=SOURCE_START_PINNED,
+        )
+
+    return list(entries.values())
 
 
 def scan_apps() -> list[AppEntry]:
@@ -72,7 +184,7 @@ def scan_apps() -> list[AppEntry]:
                     continue
 
                 name = display_name_from_path(item)
-                key = f"{name.lower()}|{str(item).lower()}"
+                key = f"{name.lower()}|{str(item).lower()}|{source}"
                 entries[key] = AppEntry(
                     name=name,
                     path=str(item),
@@ -81,6 +193,10 @@ def scan_apps() -> list[AppEntry]:
                 )
         except OSError:
             continue
+
+    for app in scan_start_pinned_apps():
+        key = f"{app.name.lower()}|{app.path.lower()}|{app.source}"
+        entries[key] = app
 
     return sorted(entries.values(), key=lambda entry: entry.name.lower())
 
@@ -220,7 +336,7 @@ class WindowsToolsApp:
 
         self.query = StringVar()
         self.source_filter = StringVar(value=FILTER_ALL)
-        self.status = StringVar(value="正在扫描当前 Windows 开始菜单和桌面软件...")
+        self.status = StringVar(value="正在扫描当前 Windows 开始菜单、桌面和开始固定项...")
         self.apps: list[AppEntry] = []
         self.filtered_apps: list[AppEntry] = []
 
@@ -246,7 +362,7 @@ class WindowsToolsApp:
         self.source_box = ttk.Combobox(
             top,
             textvariable=self.source_filter,
-            values=(FILTER_ALL, SOURCE_START_MENU, SOURCE_DESKTOP),
+            values=(FILTER_ALL, SOURCE_START_MENU, SOURCE_DESKTOP, SOURCE_START_PINNED),
             state="readonly",
             width=10,
         )
@@ -283,7 +399,7 @@ class WindowsToolsApp:
         ttk.Label(bottom, textvariable=self.status).pack(side=LEFT, fill=X, expand=True)
 
     def refresh(self) -> None:
-        self.status.set("正在扫描当前 Windows 开始菜单和桌面软件...")
+        self.status.set("正在扫描当前 Windows 开始菜单、桌面和开始固定项...")
         self.tree.delete(*self.tree.get_children())
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
