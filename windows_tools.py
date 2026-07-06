@@ -8,6 +8,7 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import BOTH, END, LEFT, VERTICAL, X, Y, StringVar, Tk, messagebox
+from tkinter import font as tkfont
 from tkinter import ttk
 from xml.etree import ElementTree
 
@@ -21,6 +22,16 @@ FILTER_ALL = "全部"
 SOURCE_START_MENU = "开始菜单"
 SOURCE_DESKTOP = "桌面"
 SOURCE_START_PINNED = "开始固定"
+WINDOW_WIDTH = 1180
+WINDOW_HEIGHT = 680
+MIN_WINDOW_WIDTH = 960
+MIN_WINDOW_HEIGHT = 520
+NAME_COLUMN_WIDTH = 260
+SOURCE_COLUMN_WIDTH = 120
+PATH_COLUMN_WIDTH = 760
+MAX_NAME_COLUMN_WIDTH = 340
+MAX_SOURCE_COLUMN_WIDTH = 150
+MAX_MEASURED_ROWS = 300
 
 
 @dataclass(frozen=True)
@@ -331,8 +342,8 @@ class WindowsToolsApp:
     def __init__(self) -> None:
         self.root = Tk()
         self.root.title(APP_TITLE)
-        self.root.geometry("900x540")
-        self.root.minsize(760, 420)
+        self.root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
+        self.root.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
 
         self.query = StringVar()
         self.source_filter = StringVar(value=FILTER_ALL)
@@ -341,7 +352,16 @@ class WindowsToolsApp:
         self.filtered_apps: list[AppEntry] = []
 
         self._build_ui()
+        self._center_window()
         self.refresh()
+
+    def _center_window(self) -> None:
+        self.root.update_idletasks()
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        x = max((screen_width - WINDOW_WIDTH) // 2, 0)
+        y = max((screen_height - WINDOW_HEIGHT) // 2, 0)
+        self.root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}+{x}+{y}")
 
     def _build_ui(self) -> None:
         main = ttk.Frame(self.root, padding=12)
@@ -383,10 +403,11 @@ class WindowsToolsApp:
         self.tree.heading("name", text="软件")
         self.tree.heading("source", text="来源")
         self.tree.heading("path", text="路径")
-        self.tree.column("name", width=240, anchor="w")
-        self.tree.column("source", width=120, anchor="w")
-        self.tree.column("path", width=520, anchor="w")
+        self.tree.column("name", width=NAME_COLUMN_WIDTH, minwidth=180, anchor="w", stretch=False)
+        self.tree.column("source", width=SOURCE_COLUMN_WIDTH, minwidth=100, anchor="w", stretch=False)
+        self.tree.column("path", width=PATH_COLUMN_WIDTH, minwidth=480, anchor="w", stretch=True)
         self.tree.bind("<Double-1>", lambda _event: self.launch_selected())
+        self.tree.bind("<Configure>", lambda _event: self.update_column_widths())
         self.tree.grid(row=0, column=0, sticky="nsew")
 
         scrollbar = ttk.Scrollbar(body, orient=VERTICAL, command=self.tree.yview)
@@ -427,9 +448,30 @@ class WindowsToolsApp:
         for index, app in enumerate(self.filtered_apps):
             self.tree.insert("", END, iid=str(index), values=(app.name, app.source, app.path))
 
+        self.update_column_widths()
         self.status.set(
             f"共 {len(self.apps)} 项，当前显示 {len(self.filtered_apps)} 项，来源：{source}。双击也可以启动。"
         )
+
+    def update_column_widths(self) -> None:
+        tree_width = self.tree.winfo_width()
+        if tree_width <= 1:
+            return
+
+        ui_font = tkfont.nametofont("TkDefaultFont")
+        name_width = NAME_COLUMN_WIDTH
+        source_width = SOURCE_COLUMN_WIDTH
+        for app in self.filtered_apps[:MAX_MEASURED_ROWS]:
+            name_width = max(name_width, ui_font.measure(app.name) + 32)
+            source_width = max(source_width, ui_font.measure(app.source) + 32)
+
+        name_width = min(name_width, MAX_NAME_COLUMN_WIDTH)
+        source_width = min(source_width, MAX_SOURCE_COLUMN_WIDTH)
+        path_width = max(tree_width - name_width - source_width - 8, 480)
+
+        self.tree.column("name", width=name_width)
+        self.tree.column("source", width=source_width)
+        self.tree.column("path", width=path_width)
 
     def match_app(self, app: AppEntry, keyword: str) -> bool:
         return (
