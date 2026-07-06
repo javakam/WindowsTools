@@ -1,6 +1,8 @@
 import ctypes
 import os
+import subprocess
 import threading
+from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import BOTH, END, LEFT, VERTICAL, X, Y, StringVar, Tk, messagebox
@@ -83,6 +85,57 @@ def scan_apps() -> list[AppEntry]:
     return sorted(entries.values(), key=lambda entry: entry.name.lower())
 
 
+def associated_executable_for_path(path: str) -> tuple[str | None, str | None]:
+    suffix = Path(path).suffix
+    if not suffix:
+        return None, "文件没有扩展名，无法查找默认打开程序。"
+
+    length = wintypes.DWORD(0)
+    result = ctypes.windll.shlwapi.AssocQueryStringW(
+        0,
+        2,
+        suffix,
+        None,
+        None,
+        ctypes.byref(length),
+    )
+    if result not in (0, 1) or length.value == 0:
+        return None, f"没有找到 {suffix} 的默认打开程序。"
+
+    buffer = ctypes.create_unicode_buffer(length.value)
+    result = ctypes.windll.shlwapi.AssocQueryStringW(
+        0,
+        2,
+        suffix,
+        None,
+        buffer,
+        ctypes.byref(length),
+    )
+    if result != 0 or not buffer.value.strip():
+        return None, f"无法读取 {suffix} 的默认打开程序。"
+
+    executable = os.path.expandvars(buffer.value.strip())
+    if not Path(executable).exists():
+        return None, f"默认打开程序不存在：{executable}"
+
+    return executable, None
+
+
+def resolve_document_target(
+    document_path: str,
+    arguments: str = "",
+    working_directory: str | None = None,
+) -> tuple[LaunchTarget | None, str | None]:
+    executable, error = associated_executable_for_path(document_path)
+    if error:
+        return None, error
+
+    document_argument = subprocess.list2cmdline([document_path])
+    final_arguments = document_argument if not arguments else f"{document_argument} {arguments}"
+    cwd = working_directory if working_directory and Path(working_directory).exists() else str(Path(document_path).parent)
+    return LaunchTarget(executable, final_arguments, cwd), None
+
+
 def resolve_shortcut(path: str) -> tuple[LaunchTarget | None, str | None]:
     shortcut_path = Path(path)
     if not shortcut_path.exists():
@@ -92,7 +145,7 @@ def resolve_shortcut(path: str) -> tuple[LaunchTarget | None, str | None]:
     if suffix != ".lnk":
         if suffix == ".exe":
             return LaunchTarget(str(shortcut_path), "", str(shortcut_path.parent)), None
-        return None, f"当前只支持启动 exe 或解析 lnk 快捷方式，文件类型为：{suffix or '未知'}"
+        return resolve_document_target(str(shortcut_path))
 
     shell = None
     shortcut = None
@@ -116,10 +169,11 @@ def resolve_shortcut(path: str) -> tuple[LaunchTarget | None, str | None]:
     target = Path(target_path)
     if not target.exists():
         return None, f"快捷方式目标不存在：{target_path}"
-    if target.suffix.lower() != ".exe":
-        return None, f"当前只支持以管理员权限启动 exe，目标类型为：{target.suffix or '未知'}"
 
     cwd = working_directory if working_directory and Path(working_directory).exists() else str(target.parent)
+    if target.suffix.lower() != ".exe":
+        return resolve_document_target(str(target), arguments, cwd)
+
     return LaunchTarget(str(target), arguments, cwd), None
 
 
@@ -179,14 +233,16 @@ class WindowsToolsApp:
 
         top = ttk.Frame(main)
         top.pack(fill=X)
+        top.columnconfigure(7, weight=1)
 
-        ttk.Label(top, text="搜索").pack(side=LEFT)
+        ttk.Label(top, text="搜索").grid(row=0, column=0, sticky="w")
         search = ttk.Entry(top, textvariable=self.query)
-        search.pack(side=LEFT, fill=X, expand=True, padx=(8, 10))
+        search.configure(width=34)
+        search.grid(row=0, column=1, sticky="w", padx=(8, 16))
         search.bind("<KeyRelease>", lambda _event: self.apply_filter())
         search.bind("<Escape>", lambda _event: self.clear_search())
 
-        ttk.Label(top, text="来源").pack(side=LEFT)
+        ttk.Label(top, text="来源").grid(row=0, column=2, sticky="w")
         self.source_box = ttk.Combobox(
             top,
             textvariable=self.source_filter,
@@ -194,11 +250,12 @@ class WindowsToolsApp:
             state="readonly",
             width=10,
         )
-        self.source_box.pack(side=LEFT, padx=(8, 8))
+        self.source_box.grid(row=0, column=3, sticky="w", padx=(8, 16))
         self.source_box.bind("<<ComboboxSelected>>", lambda _event: self.apply_filter())
 
-        ttk.Button(top, text="刷新", command=self.refresh).pack(side=LEFT, padx=(0, 8))
-        ttk.Button(top, text="管理员启动", command=self.launch_selected).pack(side=LEFT)
+        ttk.Button(top, text="清空", command=self.clear_search).grid(row=0, column=4, sticky="w", padx=(0, 8))
+        ttk.Button(top, text="刷新", command=self.refresh).grid(row=0, column=5, sticky="w", padx=(0, 8))
+        ttk.Button(top, text="管理员启动", command=self.launch_selected).grid(row=0, column=6, sticky="w")
 
         body = ttk.Frame(main)
         body.pack(fill=BOTH, expand=True, pady=(12, 8))
