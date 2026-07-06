@@ -17,12 +17,12 @@ import pythoncom
 import win32com.client
 
 
-APP_TITLE = "WindowsTools20260702V1"
+APP_TITLE = "WindowsTools20260706V1"
 SUPPORTED_EXTENSIONS = {".lnk", ".exe", ".appref-ms"}
 FILTER_ALL = "全部"
 SOURCE_START_MENU = "开始菜单"
 SOURCE_DESKTOP = "桌面"
-SOURCE_START_PINNED = "开始固定"
+SOURCE_START_PINNED = "已固定"
 SOURCE_FILTERS = (FILTER_ALL, SOURCE_START_MENU, SOURCE_START_PINNED, SOURCE_DESKTOP)
 SETTINGS_DIR_NAME = "WindowsTools"
 SETTINGS_FILE_NAME = "settings.json"
@@ -35,8 +35,8 @@ SOURCE_COLUMN_WIDTH = 130
 PATH_MIN_COLUMN_WIDTH = 760
 UI_FONT_SIZE = 10
 TREE_ROW_HEIGHT = 28
-TOP_LEFT_RESTORE_MARGIN = 80
 WINDOW_GEOMETRY_PATTERN = re.compile(r"^(\d+)x(\d+)([+-]\d+)([+-]\d+)$")
+WINDOW_SIZE_PATTERN = re.compile(r"^(\d+)x(\d+)$")
 
 
 @dataclass(frozen=True)
@@ -46,6 +46,7 @@ class AppEntry:
     source: str
     source_group: str
     drive: str = FILTER_ALL
+    display_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -61,62 +62,53 @@ def get_settings_path() -> Path:
     return base_dir / SETTINGS_DIR_NAME / SETTINGS_FILE_NAME
 
 
-def load_saved_geometry() -> str | None:
+def clamped_window_size(width: int, height: int, screen_width: int, screen_height: int) -> tuple[int, int]:
+    return (
+        min(max(width, MIN_WINDOW_WIDTH), screen_width),
+        min(max(height, MIN_WINDOW_HEIGHT), screen_height),
+    )
+
+
+def load_saved_window_size() -> tuple[int, int] | None:
     settings_path = get_settings_path()
     try:
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
 
+    size = settings.get("size")
+    if isinstance(size, str):
+        match = WINDOW_SIZE_PATTERN.match(size)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+
     geometry = settings.get("geometry")
-    if isinstance(geometry, str) and WINDOW_GEOMETRY_PATTERN.match(geometry):
-        return geometry
+    if isinstance(geometry, str):
+        match = WINDOW_GEOMETRY_PATTERN.match(geometry)
+        if match:
+            return int(match.group(1)), int(match.group(2))
     return None
 
 
-def save_window_geometry(geometry: str) -> None:
-    if not WINDOW_GEOMETRY_PATTERN.match(geometry):
+def save_window_size(geometry: str) -> None:
+    match = WINDOW_GEOMETRY_PATTERN.match(geometry)
+    if not match:
         return
 
     settings_path = get_settings_path()
     try:
         settings_path.parent.mkdir(parents=True, exist_ok=True)
-        settings_path.write_text(json.dumps({"geometry": geometry}, ensure_ascii=False), encoding="utf-8")
+        size = f"{match.group(1)}x{match.group(2)}"
+        settings_path.write_text(json.dumps({"size": size}, ensure_ascii=False), encoding="utf-8")
     except OSError:
         return
 
 
-def clamp_window_geometry(geometry: str, screen_width: int, screen_height: int) -> str:
-    match = WINDOW_GEOMETRY_PATTERN.match(geometry)
-    if not match:
-        return geometry
-
-    width = min(max(int(match.group(1)), MIN_WINDOW_WIDTH), screen_width)
-    height = min(max(int(match.group(2)), MIN_WINDOW_HEIGHT), screen_height)
-    x = max(min(int(match.group(3)), max(screen_width - 100, 0)), 0)
-    y = max(min(int(match.group(4)), max(screen_height - 100, 0)), 0)
-    return f"{width}x{height}+{x}+{y}"
-
-
 def centered_window_geometry(width: int, height: int, screen_width: int, screen_height: int) -> str:
+    width, height = clamped_window_size(width, height, screen_width, screen_height)
     x = max((screen_width - width) // 2, 0)
     y = max((screen_height - height) // 2, 0)
     return f"{width}x{height}+{x}+{y}"
-
-
-def safe_restore_window_geometry(geometry: str, screen_width: int, screen_height: int) -> str:
-    match = WINDOW_GEOMETRY_PATTERN.match(geometry)
-    if not match:
-        return geometry
-
-    width = min(max(int(match.group(1)), MIN_WINDOW_WIDTH), screen_width)
-    height = min(max(int(match.group(2)), MIN_WINDOW_HEIGHT), screen_height)
-    x = int(match.group(3))
-    y = int(match.group(4))
-    if x <= TOP_LEFT_RESTORE_MARGIN and y <= TOP_LEFT_RESTORE_MARGIN:
-        return centered_window_geometry(width, height, screen_width, screen_height)
-
-    return clamp_window_geometry(f"{width}x{height}{match.group(3)}{match.group(4)}", screen_width, screen_height)
 
 
 def drive_filter_from_path(path: str) -> str:
@@ -126,27 +118,36 @@ def drive_filter_from_path(path: str) -> str:
     return f"{drive[0]}盘"
 
 
-def drive_filter_for_item(path: Path, shell=None) -> str:
+def shortcut_target_path(path: Path, shell=None) -> str | None:
     if path.suffix.lower() != ".lnk" or shell is None:
-        return drive_filter_from_path(str(path))
+        return None
 
     shortcut = None
     try:
         shortcut = shell.CreateShortcut(str(path))
         target_path = os.path.expandvars(shortcut.TargetPath or "").strip()
     except Exception:
-        return drive_filter_from_path(str(path))
+        return None
     finally:
         shortcut = None
 
-    return drive_filter_from_path(target_path or str(path))
+    return target_path or None
 
 
-def cached_drive_filter_for_item(path: Path, shell, cache: dict[str, str]) -> str:
+def display_path_and_drive_for_item(path: Path, shell=None) -> tuple[str, str]:
+    display_path = shortcut_target_path(path, shell) or str(path)
+    return display_path, drive_filter_from_path(display_path)
+
+
+def cached_display_path_and_drive_for_item(path: Path, shell, cache: dict[str, tuple[str, str]]) -> tuple[str, str]:
     key = str(path).lower()
     if key not in cache:
-        cache[key] = drive_filter_for_item(path, shell)
+        cache[key] = display_path_and_drive_for_item(path, shell)
     return cache[key]
+
+
+def app_display_path(app: AppEntry) -> str:
+    return app.display_path or app.path
 
 
 def get_scan_roots() -> list[tuple[str, Path]]:
@@ -262,7 +263,7 @@ def desktop_links_from_start_layout_xml(layout_text: str) -> list[str]:
     return links
 
 
-def scan_start_pinned_apps(shell=None, drive_cache: dict[str, str] | None = None) -> list[AppEntry]:
+def scan_start_pinned_apps(shell=None, path_cache: dict[str, tuple[str, str]] | None = None) -> list[AppEntry]:
     layout_text = export_start_layout_text()
     if not layout_text:
         return []
@@ -275,16 +276,18 @@ def scan_start_pinned_apps(shell=None, drive_cache: dict[str, str] | None = None
 
         name = display_name_from_path(path)
         key = f"{name.lower()}|{str(path).lower()}|{SOURCE_START_PINNED}"
+        display_path, drive = (
+            cached_display_path_and_drive_for_item(path, shell, path_cache)
+            if path_cache is not None
+            else display_path_and_drive_for_item(path, shell)
+        )
         entries[key] = AppEntry(
             name=name,
             path=str(path),
             source=SOURCE_START_PINNED,
             source_group=SOURCE_START_PINNED,
-            drive=(
-                cached_drive_filter_for_item(path, shell, drive_cache)
-                if drive_cache is not None
-                else drive_filter_for_item(path, shell)
-            ),
+            drive=drive,
+            display_path=display_path,
         )
 
     return list(entries.values())
@@ -292,7 +295,7 @@ def scan_start_pinned_apps(shell=None, drive_cache: dict[str, str] | None = None
 
 def scan_apps() -> list[AppEntry]:
     entries: dict[str, AppEntry] = {}
-    drive_cache: dict[str, str] = {}
+    path_cache: dict[str, tuple[str, str]] = {}
     shell = None
     co_initialized = False
 
@@ -312,17 +315,19 @@ def scan_apps() -> list[AppEntry]:
 
                     name = display_name_from_path(item)
                     key = f"{name.lower()}|{str(item).lower()}|{source}"
+                    display_path, drive = cached_display_path_and_drive_for_item(item, shell, path_cache)
                     entries[key] = AppEntry(
                         name=name,
                         path=str(item),
                         source=source,
                         source_group=source_group_from_source(source),
-                        drive=cached_drive_filter_for_item(item, shell, drive_cache),
+                        drive=drive,
+                        display_path=display_path,
                     )
             except OSError:
                 continue
 
-        for app in scan_start_pinned_apps(shell, drive_cache):
+        for app in scan_start_pinned_apps(shell, path_cache):
             key = f"{app.name.lower()}|{app.path.lower()}|{app.source}"
             entries[key] = app
     finally:
@@ -474,14 +479,14 @@ class WindowsToolsApp:
         self.query = StringVar()
         self.source_filter = StringVar(value=FILTER_ALL)
         self.drive_filter = StringVar(value=FILTER_ALL)
-        self.status = StringVar(value="正在扫描当前 Windows 开始菜单、桌面和开始固定项...")
+        self.status = StringVar(value="正在扫描当前 Windows 开始菜单、桌面和已固定项...")
         self.apps: list[AppEntry] = []
         self.filtered_apps: list[AppEntry] = []
         self.drive_filters: tuple[str, ...] = (FILTER_ALL,)
         self.is_closing = False
 
         self._build_ui()
-        self._restore_or_center_window()
+        self._center_window_with_saved_size()
         self.refresh()
 
     def _configure_fonts(self) -> None:
@@ -495,21 +500,15 @@ class WindowsToolsApp:
             if font_name == "TkHeadingFont":
                 named_font.configure(weight="bold")
 
-    def _center_window(self) -> None:
+    def _center_window_with_size(self, width: int, height: int) -> None:
         self.root.update_idletasks()
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
-        self.root.geometry(centered_window_geometry(WINDOW_WIDTH, WINDOW_HEIGHT, screen_width, screen_height))
+        self.root.geometry(centered_window_geometry(width, height, screen_width, screen_height))
 
-    def _restore_or_center_window(self) -> None:
-        geometry = load_saved_geometry()
-        if not geometry:
-            self._center_window()
-            return
-
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-        self.root.geometry(safe_restore_window_geometry(geometry, screen_width, screen_height))
+    def _center_window_with_saved_size(self) -> None:
+        width, height = load_saved_window_size() or (WINDOW_WIDTH, WINDOW_HEIGHT)
+        self._center_window_with_size(width, height)
 
     def _build_ui(self) -> None:
         style = ttk.Style(self.root)
@@ -615,7 +614,7 @@ class WindowsToolsApp:
             self.drive_group.grid_configure(row=0, column=4, columnspan=1, sticky="w", padx=(0, 0), pady=(0, 4))
 
     def refresh(self) -> None:
-        self.status.set("正在扫描当前 Windows 开始菜单、桌面和开始固定项...")
+        self.status.set("正在扫描当前 Windows 开始菜单、桌面和已固定项...")
         self.tree.delete(*self.tree.get_children())
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
@@ -680,7 +679,7 @@ class WindowsToolsApp:
 
         self.tree.delete(*self.tree.get_children())
         for index, app in enumerate(self.filtered_apps):
-            self.tree.insert("", END, iid=str(index), values=(app.name, app.source, app.path))
+            self.tree.insert("", END, iid=str(index), values=(app.name, app.source, app_display_path(app)))
 
         self.update_column_widths()
         self.status.set(
@@ -728,6 +727,7 @@ class WindowsToolsApp:
             or keyword in app.source.lower()
             or keyword in app.drive.lower()
             or keyword in app.path.lower()
+            or keyword in app_display_path(app).lower()
         )
 
     def clear_search(self) -> None:
@@ -752,7 +752,7 @@ class WindowsToolsApp:
             messagebox.showinfo(APP_TITLE, "请先选择一个软件。")
             return
 
-        path = Path(app.path)
+        path = Path(app_display_path(app))
         if path.exists():
             command = ["explorer.exe", f"/select,{str(path)}"]
         elif path.parent.exists():
@@ -780,7 +780,7 @@ class WindowsToolsApp:
             return
 
         self.root.clipboard_clear()
-        self.root.clipboard_append(app.path)
+        self.root.clipboard_append(app_display_path(app))
         self.status.set(f"{app.name}: 已复制路径。")
 
     def run(self) -> None:
@@ -789,7 +789,7 @@ class WindowsToolsApp:
     def close(self) -> None:
         self.is_closing = True
         if self.root.state() == "normal":
-            save_window_geometry(self.root.geometry())
+            save_window_size(self.root.geometry())
         self.root.destroy()
 
 
